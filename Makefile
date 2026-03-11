@@ -12,7 +12,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/blue-merle
 	SECTION:=utils
 	CATEGORY:=Utilities
-	EXTRA_DEPENDS:=luci-base, gl-sdk4-mcu, coreutils-shred, python3-pyserial
+	DEPENDS:=+luci-base +gl-sdk4-mcu +coreutils-shred +python3-pyserial
 	TITLE:=Anonymity Enhancements for GL-E750 Mudi
 endef
 
@@ -90,8 +90,8 @@ endef
 
 define Package/blue-merle/postinst
 	#!/bin/sh
-	uci set switch-button.@main[0].func='sim'
-	uci commit switch-button
+	#uci set switch-button.@main[0].func='sim'
+	#uci commit switch-button
 
 	/etc/init.d/gl_clients start
 
@@ -100,6 +100,6 @@ endef
 
 define Package/blue-merle/postrm
 	#!/bin/sh
-	uci set switch-button.@main[0].func='tor'
+	uci set switch-button.@main[0].func='wg'
 endef
 $(eval $(call BuildPackage,$(PKG_NAME)))

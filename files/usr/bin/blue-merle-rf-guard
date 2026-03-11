@@ -1,0 +1,315 @@
+#!/bin/sh
+
+. /lib/blue-merle/functions.sh
+. /lib/functions/modem.sh
+
+STATE_DIR="/etc/blue-merle"
+STATE_FILE="${STATE_DIR}/rf-guard.state"
+RUNTIME_DIR="/tmp/blue-merle"
+LOCK_FILE="${RUNTIME_DIR}/rf-guard.lock"
+POLL_INTERVAL=2
+MESSAGE_DELAY=1
+
+CURRENT_SIM_ID=""
+SIM_REMOVED=0
+
+display_msg() {
+	# Send message to router OLED display via MCU serial port.
+	# Display is 16 chars wide; text wraps automatically.
+	echo "{\"msg\": \"$1\"}" > /dev/ttyS0 2>/dev/null || true
+}
+
+log_step() {
+	local message="$1"
+	logger -p notice -t blue-merle-rf-guard "$message"
+	echo "[blue-merle-rf-guard] $message"
+	display_msg "$message"
+	sleep "$MESSAGE_DELAY"
+}
+
+modem_cmd() {
+	local bus
+	bus="$(get_modem_bus 2>/dev/null)"
+	if [ -n "$bus" ]; then
+		gl_modem -B "$bus" AT "$1"
+	else
+		gl_modem AT "$1"
+	fi
+}
+
+set_rf_off() {
+	local attempt=0
+	while [ "$attempt" -lt 5 ]; do
+		if modem_cmd "AT+CFUN=4" | grep -q "OK"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+set_rf_on() {
+	if modem_cmd "AT+CFUN=1" | grep -q "OK"; then
+		return 0
+	fi
+	return 1
+}
+
+read_iccid_raw() {
+	modem_cmd "AT+CCID" 2>/dev/null | grep -o -E '[0-9]{18,22}' | head -n1
+}
+
+read_imsi_raw() {
+	modem_cmd "AT+CIMI" 2>/dev/null | grep -o -E '[0-9]{6,15}' | head -n1
+}
+
+read_imei_raw() {
+	modem_cmd "AT+GSN" 2>/dev/null | grep -o -E '[0-9]{14,15}' | head -n1
+}
+
+get_sim_id() {
+	local iccid
+	local imsi
+	iccid="$(read_iccid_raw)"
+	if [ -n "$iccid" ]; then
+		echo "iccid:${iccid}"
+		return 0
+	fi
+
+	imsi="$(read_imsi_raw)"
+	if [ -n "$imsi" ]; then
+		echo "imsi:${imsi}"
+		return 0
+	fi
+
+	return 1
+}
+
+load_state() {
+	if [ -f "$STATE_FILE" ]; then
+		. "$STATE_FILE"
+	fi
+}
+
+save_state() {
+	local sim_id="$1"
+	local imei="$2"
+	mkdir -p "$STATE_DIR"
+	cat > "$STATE_FILE" <<EOF
+STATE_SIM_ID='$sim_id'
+STATE_IMEI='$imei'
+STATE_EVER_SEEN_SIM='1'
+EOF
+}
+
+reset_apn() {
+	local bus
+	local modem_iface
+
+	bus="$(get_modem_bus 2>/dev/null)"
+	modem_iface="$(get_modem_iface "$bus" 2>/dev/null)"
+
+	if [ -n "$modem_iface" ]; then
+		uci -q delete "network.${modem_iface}.apn"
+		uci -q delete "network.${modem_iface}.apns"
+		uci commit network
+		ubus call "network.interface.${modem_iface}" down >/dev/null 2>&1
+		sleep 1
+		ubus call "network.interface.${modem_iface}" up >/dev/null 2>&1
+	fi
+
+	modem_cmd 'AT+CGDCONT=1,"IPV4V6",""' >/dev/null 2>&1
+	modem_cmd 'AT+CGDCONT=2,"IPV4V6",""' >/dev/null 2>&1
+	modem_cmd 'AT+CGDCONT=3,"IPV4V6",""' >/dev/null 2>&1
+}
+
+restart_modem() {
+	log_step "Resetting modem..."
+	until modem_cmd "AT+QPOWD" | grep -q "OK"
+	do
+		log_step "Modem reset command failed. Retrying..."
+	sleep 1
+	done
+
+	local waited=0
+	until modem_cmd "AT" | grep -q "OK"
+	do
+		waited=$((waited + 1))
+		if [ "$waited" -ge 60 ]; then
+			log_step "Modem did not become ready within 60s."
+			return 1
+		fi
+		sleep 1
+	done
+	return 0
+}
+
+generate_deterministic_imei_and_verify() {
+	local before_imei
+	local after_imei
+	local set_log
+
+	before_imei="$(read_imei_raw)"
+	set_log="$(timeout 20 python3 /lib/blue-merle/imei_generate.py -d 2>&1)"
+	if [ $? -ne 0 ]; then
+		logger -p notice -t blue-merle-rf-guard "Deterministic IMEI generation failed: $set_log"
+		return 1
+	fi
+
+	after_imei="$(read_imei_raw)"
+	if [ -z "$after_imei" ]; then
+		logger -p notice -t blue-merle-rf-guard "Unable to read IMEI after deterministic generation."
+		return 1
+	fi
+
+	echo "$set_log" | grep -q "successfully changed"
+	if [ $? -ne 0 ]; then
+		logger -p notice -t blue-merle-rf-guard "Deterministic IMEI verification failed. Before=$before_imei After=$after_imei"
+		return 1
+	fi
+
+	mkdir -p /tmp/modem.1-1.2
+	echo "$after_imei" > /tmp/modem.1-1.2/modem-imei
+	if [ -d /root/esim ]; then
+		echo "$after_imei" > /root/esim/imei
+		shred -u /root/esim/log.txt >/dev/null 2>&1
+	fi
+
+	log_step "Deterministic IMEI has been written and verified: ${after_imei}"
+	return 0
+}
+
+apply_new_sim_flow() {
+	local sim_id="$1"
+	local imei
+
+	log_step "Switching modem to RF-off to prevent IMSI/IMEI leakage."
+	if ! set_rf_off; then
+		log_step "Failed to disable RF (CFUN=4)."
+		return 1
+	fi
+
+	log_step "Generating deterministic IMEI for inserted SIM."
+	if ! generate_deterministic_imei_and_verify; then
+		log_step "Deterministic IMEI step failed. Keeping RF disabled."
+		return 1
+	fi
+
+	log_step "Resetting APN settings for new SIM."
+	reset_apn
+
+	if ! restart_modem; then
+		log_step "Modem restart failed after IMEI/APN update."
+		return 1
+	fi
+
+	imei="$(read_imei_raw)"
+	save_state "$sim_id" "$imei"
+	STATE_SIM_ID="$sim_id"
+	STATE_IMEI="$imei"
+	STATE_EVER_SEEN_SIM="1"
+	CURRENT_SIM_ID="$sim_id"
+	SIM_REMOVED=0
+	log_step "SIM change flow completed successfully."
+	return 0
+}
+
+handle_boot_gate() {
+	local sim_id
+
+	log_step "Boot gate started. Blocking RF until SIM/IMEI validation is complete."
+	set_rf_off >/dev/null 2>&1
+	load_state
+
+	sim_id="$(get_sim_id 2>/dev/null)"
+	if [ -z "$sim_id" ]; then
+		if [ -z "$STATE_EVER_SEEN_SIM" ]; then
+			log_step "Clean router boot detected and no SIM present yet. RF remains disabled."
+		else
+			log_step "SIM not present at boot. RF remains disabled until SIM is inserted."
+		fi
+		CURRENT_SIM_ID=""
+		SIM_REMOVED=1
+		return 0
+	fi
+
+	if [ -n "$STATE_SIM_ID" ] && [ "$sim_id" = "$STATE_SIM_ID" ]; then
+		log_step "Known SIM detected at boot. Re-enabling RF."
+		set_rf_on >/dev/null 2>&1
+		CURRENT_SIM_ID="$sim_id"
+		SIM_REMOVED=0
+		return 0
+	fi
+
+	if [ -z "$STATE_EVER_SEEN_SIM" ]; then
+		log_step "Clean router boot with first SIM insertion detected."
+	else
+		log_step "New SIM detected at boot. Deterministic IMEI update is required."
+	fi
+
+	if ! apply_new_sim_flow "$sim_id"; then
+		SIM_REMOVED=1
+		return 1
+	fi
+	return 0
+}
+
+monitor_loop() {
+	local sim_id
+
+	while true
+	do
+		sim_id="$(get_sim_id 2>/dev/null)"
+
+		if [ -z "$sim_id" ]; then
+			if [ "$SIM_REMOVED" -eq 0 ]; then
+				log_step "SIM removed during runtime. Forcing RF-off mode."
+				set_rf_off >/dev/null 2>&1
+				SIM_REMOVED=1
+			fi
+			sleep "$POLL_INTERVAL"
+			continue
+		fi
+
+		if [ "$SIM_REMOVED" -eq 1 ]; then
+			if [ -n "$CURRENT_SIM_ID" ] && [ "$sim_id" = "$CURRENT_SIM_ID" ]; then
+				log_step "Previously used SIM reinserted. Re-enabling RF without IMEI change."
+				set_rf_on >/dev/null 2>&1
+				SIM_REMOVED=0
+				sleep "$POLL_INTERVAL"
+				continue
+			fi
+
+			log_step "SIM inserted after removal. Running deterministic IMEI flow."
+			if ! apply_new_sim_flow "$sim_id"; then
+				SIM_REMOVED=1
+			fi
+			sleep "$POLL_INTERVAL"
+			continue
+		fi
+
+		if [ -n "$CURRENT_SIM_ID" ] && [ "$sim_id" != "$CURRENT_SIM_ID" ]; then
+			log_step "SIM hot-swap detected during runtime."
+			if ! apply_new_sim_flow "$sim_id"; then
+				SIM_REMOVED=1
+			fi
+		fi
+
+		sleep "$POLL_INTERVAL"
+	done
+}
+
+main() {
+	mkdir -p "$RUNTIME_DIR"
+	exec 9>"$LOCK_FILE"
+	if ! flock -n 9; then
+		log_step "Another rf-guard instance is already running."
+		exit 0
+	fi
+
+	handle_boot_gate
+	monitor_loop
+}
+
+main "$@"

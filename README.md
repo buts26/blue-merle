@@ -93,6 +93,42 @@ Open LuCI from `System` > `Advanced Settings` in Mudi's web interface. Find the 
 
 This repository contains a CI script to auto-build the project using GitHub actions. Simply fork the repository or replicate the workflow on your local machine to build packages.
 
+### Local autobuild + public artifact download
+
+You can run a local autobuild loop on your server and expose build artifacts over HTTP.
+
+```sh
+cd /path/to/blue-merle
+chmod +x scripts/*.sh
+./scripts/start-autobuild-and-serve.sh
+```
+
+By default:
+
+- Artifacts are stored in `.autobuild/public/latest/`
+- Build history is in `.autobuild/public/builds/`
+- Public HTTP port is `8080`
+- Download URL format is `http://57.128.248.236:8080/latest/`
+
+Useful commands:
+
+```sh
+# stop both background processes
+./scripts/stop-autobuild-and-serve.sh
+
+# run single build manually
+./scripts/autobuild-openwrt.sh --once
+```
+
+Optional environment variables:
+
+- `BLUE_MERLE_PUBLIC_IP` (default `57.128.248.236`)
+- `BLUE_MERLE_ARTIFACT_PORT` (default `8080`)
+- `BLUE_MERLE_POLL_SECONDS` (default `60`)
+- `BLUE_MERLE_SDK_URL` and `BLUE_MERLE_SDK_FILENAME` for a different OpenWrt SDK
+
+If your server firewall is enabled, allow incoming TCP traffic on the selected port (default `8080`).
+
 You can also setup a full OpenWRT development environment and build the *blue-merle* package using:
 
 ```sh
