@@ -238,6 +238,12 @@ apply_new_sim_flow() {
 	STATE_EVER_SEEN_SIM="1"
 	CURRENT_SIM_ID="$sim_id"
 	SIM_REMOVED=0
+	
+	log_step "Re-enabling RF after successful IMEI change."
+	if ! set_rf_on; then
+		log_step "Warning: could not re-enable RF after IMEI change."
+	fi
+	
 	log_step "SIM change flow completed successfully."
 	return 0
 }
@@ -284,6 +290,7 @@ handle_boot_gate() {
 
 monitor_loop() {
 	local sim_id
+	local removal_detected_at=0
 
 	while true
 	do
@@ -294,12 +301,32 @@ monitor_loop() {
 				log_step "SIM removed during runtime. Forcing RF-off mode."
 				set_rf_off >/dev/null 2>&1
 				SIM_REMOVED=1
+				removal_detected_at=$(date +%s)
 			fi
 			sleep "$POLL_INTERVAL"
 			continue
 		fi
 
+		# SIM detected after removal.
 		if [ "$SIM_REMOVED" -eq 1 ]; then
+			# If modem was just put into latched state by hot-removal,
+			# do an immediate power cycle to recover SIM stack visibility.
+			local time_since_removal=$(($(date +%s) - removal_detected_at))
+			if [ "$time_since_removal" -lt 10 ]; then
+				log_step "SIM detected shortly after removal. Modem may be latched. Doing power cycle..."
+				if ! restart_modem; then
+					log_step "Modem restart failed. Retrying on next poll."
+					sleep "$POLL_INTERVAL"
+					continue
+				fi
+				if ! wait_for_sim_ready; then
+					log_step "SIM not ready after modem restart. Retrying on next poll."
+					sleep "$POLL_INTERVAL"
+					continue
+				fi
+				sim_id="$(get_sim_id 2>/dev/null)"
+			fi
+
 			if [ -n "$CURRENT_SIM_ID" ] && [ "$sim_id" = "$CURRENT_SIM_ID" ]; then
 				log_step "Previously used SIM reinserted. Re-enabling RF without IMEI change."
 				set_rf_on >/dev/null 2>&1
@@ -308,20 +335,7 @@ monitor_loop() {
 				continue
 			fi
 
-			log_step "SIM inserted after removal. Restarting modem to recover SIM stack."
-			if ! restart_modem; then
-				log_step "Modem restart failed. Retrying on next poll."
-				sleep "$POLL_INTERVAL"
-				continue
-			fi
-			if ! wait_for_sim_ready; then
-				log_step "SIM not ready after modem restart. Retrying on next poll."
-				sleep "$POLL_INTERVAL"
-				continue
-			fi
-			sim_id="$(get_sim_id 2>/dev/null)"
-
-			log_step "SIM ready. Running deterministic IMEI flow."
+			log_step "SIM inserted after removal. Running deterministic IMEI flow."
 			if ! apply_new_sim_flow "$sim_id"; then
 				SIM_REMOVED=1
 			fi
