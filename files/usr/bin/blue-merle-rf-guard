@@ -11,6 +11,7 @@ POLL_INTERVAL=2
 MESSAGE_DELAY=1
 QPOWD_REBOOT_WAIT=25
 MODEM_READY_TIMEOUT=120
+MODEM_SOFT_RESTART_WAIT=8
 
 CURRENT_SIM_ID=""
 SIM_REMOVED=0
@@ -126,17 +127,7 @@ reset_apn() {
 	modem_cmd 'AT+CGDCONT=3,"IPV4V6",""' >/dev/null 2>&1
 }
 
-restart_modem() {
-	log_step "Resetting modem..."
-	until modem_cmd "AT+QPOWD" | grep -q "OK"
-	do
-		log_step "Modem reset command failed. Retrying..."
-		sleep 1
-	done
-
-	log_step "Waiting ${QPOWD_REBOOT_WAIT}s for modem power cycle..."
-	sleep "$QPOWD_REBOOT_WAIT"
-
+wait_for_modem_ready() {
 	local waited=0
 	until modem_cmd "AT" | grep -q "OK"
 	do
@@ -147,6 +138,23 @@ restart_modem() {
 		fi
 		sleep 1
 	done
+	return 0
+}
+
+power_cycle_modem() {
+	log_step "Power-cycling modem..."
+	until modem_cmd "AT+QPOWD" | grep -q "OK"
+	do
+		log_step "Modem reset command failed. Retrying..."
+		sleep 1
+	done
+
+	log_step "Waiting ${QPOWD_REBOOT_WAIT}s for modem power cycle..."
+	sleep "$QPOWD_REBOOT_WAIT"
+
+	if ! wait_for_modem_ready; then
+		return 1
+	fi
 
 	# Immediately force RF off after restart to prevent registration on old IMEI.
 	local attempt=0
@@ -157,7 +165,37 @@ restart_modem() {
 		attempt=$((attempt + 1))
 		sleep 1
 	done
-	log_step "Warning: could not apply CFUN=4 after modem restart."
+	log_step "Warning: could not apply CFUN=4 after modem power cycle."
+	return 0
+}
+
+restart_modem() {
+	log_step "Soft-resetting modem..."
+	if modem_cmd "AT+CFUN=1,1" | grep -q "OK"; then
+		log_step "Waiting ${MODEM_SOFT_RESTART_WAIT}s for soft restart..."
+		sleep "$MODEM_SOFT_RESTART_WAIT"
+	elif modem_cmd "AT+CFUN=1" | grep -q "OK"; then
+		log_step "Waiting ${MODEM_SOFT_RESTART_WAIT}s after CFUN=1..."
+		sleep "$MODEM_SOFT_RESTART_WAIT"
+	else
+		log_step "Soft modem restart command failed."
+		return 1
+	fi
+
+	if ! wait_for_modem_ready; then
+		return 1
+	fi
+
+	# Immediately force RF off after restart to prevent registration on old IMEI.
+	local attempt=0
+	while [ "$attempt" -lt 10 ]; do
+		if modem_cmd "AT+CFUN=4" | grep -q "OK"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	log_step "Warning: could not apply CFUN=4 after soft modem restart."
 	return 0
 }
 
@@ -319,7 +357,7 @@ monitor_loop() {
 			local time_since_removal=$(($(date +%s) - removal_detected_at))
 			if [ "$time_since_removal" -lt 10 ]; then
 				log_step "SIM detected shortly after removal. Modem may be latched. Doing power cycle..."
-				if ! restart_modem; then
+				if ! power_cycle_modem; then
 					log_step "Modem restart failed. Retrying on next poll."
 					sleep "$POLL_INTERVAL"
 					continue
