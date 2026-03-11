@@ -129,7 +129,7 @@ restart_modem() {
 	until modem_cmd "AT+QPOWD" | grep -q "OK"
 	do
 		log_step "Modem reset command failed. Retrying..."
-	sleep 1
+		sleep 1
 	done
 
 	local waited=0
@@ -142,7 +142,34 @@ restart_modem() {
 		fi
 		sleep 1
 	done
+
+	# Immediately force RF off after restart to prevent registration on old IMEI.
+	local attempt=0
+	while [ "$attempt" -lt 10 ]; do
+		if modem_cmd "AT+CFUN=4" | grep -q "OK"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	log_step "Warning: could not apply CFUN=4 after modem restart."
 	return 0
+}
+
+wait_for_sim_ready() {
+	local waited=0
+	local max_wait=60
+	log_step "Waiting for SIM to become ready..."
+	while [ "$waited" -lt "$max_wait" ]; do
+		if get_sim_id >/dev/null 2>&1; then
+			log_step "SIM is ready."
+			return 0
+		fi
+		waited=$((waited + 1))
+		sleep 1
+	done
+	log_step "SIM did not become ready within ${max_wait}s."
+	return 1
 }
 
 generate_deterministic_imei_and_verify() {
@@ -281,7 +308,20 @@ monitor_loop() {
 				continue
 			fi
 
-			log_step "SIM inserted after removal. Running deterministic IMEI flow."
+			log_step "SIM inserted after removal. Restarting modem to recover SIM stack."
+			if ! restart_modem; then
+				log_step "Modem restart failed. Retrying on next poll."
+				sleep "$POLL_INTERVAL"
+				continue
+			fi
+			if ! wait_for_sim_ready; then
+				log_step "SIM not ready after modem restart. Retrying on next poll."
+				sleep "$POLL_INTERVAL"
+				continue
+			fi
+			sim_id="$(get_sim_id 2>/dev/null)"
+
+			log_step "SIM ready. Running deterministic IMEI flow."
 			if ! apply_new_sim_flow "$sim_id"; then
 				SIM_REMOVED=1
 			fi
