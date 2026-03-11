@@ -97,7 +97,7 @@ collect_artifacts() {
   local stamp
   local out_dir
   stamp="$(date +%Y%m%d-%H%M%S)"
-  out_dir="${PUBLIC_DIR}/builds/${stamp}-${commit:0:8}"
+  out_dir="${PUBLIC_DIR}/builds/${stamp}-${commit:0:16}"
 
   mkdir -p "${out_dir}"
   cp -f "${SDK_ROOT}/bin/packages/mips_24kc/base/${PACKAGE_NAME}"*.ipk "${out_dir}/"
@@ -108,7 +108,11 @@ timestamp=${stamp}
 package=${PACKAGE_NAME}
 EOF
 
-  ln -sfn "${out_dir}" "${PUBLIC_DIR}/latest"
+  # Copy (not symlink) into latest/ so Python http.server serves it correctly.
+  rm -rf "${PUBLIC_DIR}/latest"
+  mkdir -p "${PUBLIC_DIR}/latest"
+  cp -f "${out_dir}/"* "${PUBLIC_DIR}/latest/"
+  log "Artifacts copied to ${PUBLIC_DIR}/latest/"
 }
 
 build_once() {
