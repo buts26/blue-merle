@@ -73,11 +73,9 @@ def set_imei(imei):
         print(b'Output of AT+EGMR (Set IMEI) command: ' + output)
         print('Output is of type: ' + str(type(output)))
 
-    new_imei = get_imei()
-    if (verbose):
-        print(b"New IMEI: "+new_imei+b" Old IMEI: "+imei.encode())
-
-    if new_imei == imei.encode():
+    # The new IMEI is only readable after a full modem power cycle (AT+QPOWD).
+    # So we verify by checking the AT response contains OK, not by reading back.
+    if b'OK' in output:
         print("IMEI has been successfully changed.")
         return True
     else:

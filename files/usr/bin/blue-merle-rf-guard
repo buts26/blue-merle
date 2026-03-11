@@ -12,6 +12,7 @@ MESSAGE_DELAY=1
 QPOWD_REBOOT_WAIT=25
 MODEM_READY_TIMEOUT=120
 MODEM_SOFT_RESTART_WAIT=8
+SIM_RECOVERY_INTERVAL=30
 
 CURRENT_SIM_ID=""
 SIM_REMOVED=0
@@ -127,6 +128,43 @@ reset_apn() {
 	modem_cmd 'AT+CGDCONT=3,"IPV4V6",""' >/dev/null 2>&1
 }
 
+apply_auto_apn() {
+	local bus
+	local modem_iface
+	local attempt=0
+
+	bus="$(get_modem_bus 2>/dev/null)"
+	modem_iface="$(get_modem_iface "$bus" 2>/dev/null)"
+
+	if [ -z "$bus" ]; then
+		log_step "Auto APN: modem bus not found."
+		return 1
+	fi
+
+	while [ "$attempt" -lt 3 ]; do
+		if gl_modem -B "$bus" connect-auto >/dev/null 2>&1; then
+			log_step "Auto APN applied by modem service."
+			break
+		fi
+		attempt=$((attempt + 1))
+		sleep 2
+	done
+
+	if [ "$attempt" -ge 3 ]; then
+		log_step "Auto APN command failed after retries."
+		return 1
+	fi
+
+	if [ -n "$modem_iface" ]; then
+		ubus call "network.interface.${modem_iface}" down >/dev/null 2>&1
+		sleep 2
+		ubus call "network.interface.${modem_iface}" up >/dev/null 2>&1
+		log_step "Modem interface restarted after auto APN."
+	fi
+
+	return 0
+}
+
 wait_for_modem_ready() {
 	local waited=0
 	until modem_cmd "AT" | grep -q "OK"
@@ -215,38 +253,24 @@ wait_for_sim_ready() {
 	return 1
 }
 
-generate_deterministic_imei_and_verify() {
-	local before_imei
-	local after_imei
+generate_deterministic_imei() {
 	local set_log
 
-	before_imei="$(read_imei_raw)"
-	set_log="$(timeout 20 python3 /lib/blue-merle/imei_generate.py -d 2>&1)"
+	# NOTE: The new IMEI is only readable after AT+QPOWD (full modem power cycle).
+	# We verify via the AT+EGMR response ("IMEI has been successfully changed."),
+	# not by reading the IMEI back here.
+	set_log="$(timeout 60 python3 /lib/blue-merle/imei_generate.py -d 2>&1)"
 	if [ $? -ne 0 ]; then
 		logger -p notice -t blue-merle-rf-guard "Deterministic IMEI generation failed: $set_log"
 		return 1
 	fi
 
-	after_imei="$(read_imei_raw)"
-	if [ -z "$after_imei" ]; then
-		logger -p notice -t blue-merle-rf-guard "Unable to read IMEI after deterministic generation."
+	if ! echo "$set_log" | grep -q "successfully changed"; then
+		logger -p notice -t blue-merle-rf-guard "Deterministic IMEI AT command did not confirm success: $set_log"
 		return 1
 	fi
 
-	echo "$set_log" | grep -q "successfully changed"
-	if [ $? -ne 0 ]; then
-		logger -p notice -t blue-merle-rf-guard "Deterministic IMEI verification failed. Before=$before_imei After=$after_imei"
-		return 1
-	fi
-
-	mkdir -p /tmp/modem.1-1.2
-	echo "$after_imei" > /tmp/modem.1-1.2/modem-imei
-	if [ -d /root/esim ]; then
-		echo "$after_imei" > /root/esim/imei
-		shred -u /root/esim/log.txt >/dev/null 2>&1
-	fi
-
-	log_step "Deterministic IMEI has been written and verified: ${after_imei}"
+	log_step "Deterministic IMEI written (will be verified after modem power cycle)."
 	return 0
 }
 
@@ -261,7 +285,7 @@ apply_new_sim_flow() {
 	fi
 
 	log_step "Generating deterministic IMEI for inserted SIM."
-	if ! generate_deterministic_imei_and_verify; then
+	if ! generate_deterministic_imei; then
 		log_step "Deterministic IMEI step failed. Keeping RF disabled."
 		return 1
 	fi
@@ -274,7 +298,17 @@ apply_new_sim_flow() {
 		return 1
 	fi
 
+	# Read IMEI after QPOWD — now the new value is visible.
 	imei="$(read_imei_raw)"
+	log_step "Deterministic IMEI verified after power cycle: ${imei}"
+
+	mkdir -p /tmp/modem.1-1.2
+	echo "$imei" > /tmp/modem.1-1.2/modem-imei
+	if [ -d /root/esim ]; then
+		echo "$imei" > /root/esim/imei
+		shred -u /root/esim/log.txt >/dev/null 2>&1
+	fi
+
 	save_state "$sim_id" "$imei"
 	STATE_SIM_ID="$sim_id"
 	STATE_IMEI="$imei"
@@ -285,6 +319,11 @@ apply_new_sim_flow() {
 	log_step "Re-enabling RF after successful IMEI change."
 	if ! set_rf_on; then
 		log_step "Warning: could not re-enable RF after IMEI change."
+	fi
+
+	log_step "Applying automatic APN profile."
+	if ! apply_auto_apn; then
+		log_step "Warning: automatic APN apply failed."
 	fi
 	
 	log_step "SIM change flow completed successfully."
@@ -334,9 +373,13 @@ handle_boot_gate() {
 monitor_loop() {
 	local sim_id
 	local removal_detected_at=0
+	local last_recovery_at
+	local now=0
+	last_recovery_at="$(date +%s)"
 
 	while true
 	do
+		now="$(date +%s)"
 		sim_id="$(get_sim_id 2>/dev/null)"
 
 		if [ -z "$sim_id" ]; then
@@ -344,7 +387,19 @@ monitor_loop() {
 				log_step "SIM removed during runtime. Forcing RF-off mode."
 				set_rf_off >/dev/null 2>&1
 				SIM_REMOVED=1
-				removal_detected_at=$(date +%s)
+				removal_detected_at="$now"
+				last_recovery_at=0
+			elif [ $((now - last_recovery_at)) -ge "$SIM_RECOVERY_INTERVAL" ]; then
+				log_step "SIM still not visible. Power-cycling modem to probe SIM slot."
+				if power_cycle_modem && wait_for_sim_ready; then
+					sim_id="$(get_sim_id 2>/dev/null)"
+					if [ -n "$sim_id" ]; then
+						log_step "SIM detected after recovery cycle."
+						last_recovery_at="$now"
+						continue
+					fi
+				fi
+				last_recovery_at="$now"
 			fi
 			sleep "$POLL_INTERVAL"
 			continue

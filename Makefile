@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=blue-merle
 PKG_VERSION:=2.0.5
-PKG_RELEASE:=$(AUTORELEASE)
+PKG_RELEASE:=$(if $(BLUE_MERLE_RELEASE),$(BLUE_MERLE_RELEASE),1)
 
 PKG_MAINTAINER:=Matthias <matthias@srlabs.de>
 PKG_LICENSE:=BSD-3-Clause

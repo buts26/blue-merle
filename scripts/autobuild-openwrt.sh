@@ -129,6 +129,8 @@ build_once() {
   local hash
   hash="$(current_content_hash)"
   local short="${hash:0:16}"
+  local release
+  release="$(date +%Y%m%d%H%M%S)"
   local logfile="${LOG_DIR}/build-${short}.log"
 
   log "Cleaning previous build artifacts..."
@@ -143,9 +145,9 @@ build_once() {
   log "Building package (hash ${short})..."
   (
     cd "${SDK_ROOT}"
-    make -j"$(nproc)" V=s "package/${PACKAGE_NAME}/compile" \
+    make -j"$(nproc)" V=s BLUE_MERLE_RELEASE="${release}" "package/${PACKAGE_NAME}/compile" \
       2>&1 | tee -a "${logfile}"
-    make -j1 V=s package/index >> "${logfile}" 2>&1
+    make -j1 V=s BLUE_MERLE_RELEASE="${release}" package/index >> "${logfile}" 2>&1
   )
 
   collect_artifacts "${short}"
