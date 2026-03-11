@@ -9,6 +9,8 @@ RUNTIME_DIR="/tmp/blue-merle"
 LOCK_FILE="${RUNTIME_DIR}/rf-guard.lock"
 POLL_INTERVAL=2
 MESSAGE_DELAY=1
+QPOWD_REBOOT_WAIT=25
+MODEM_READY_TIMEOUT=120
 
 CURRENT_SIM_ID=""
 SIM_REMOVED=0
@@ -132,12 +134,15 @@ restart_modem() {
 		sleep 1
 	done
 
+	log_step "Waiting ${QPOWD_REBOOT_WAIT}s for modem power cycle..."
+	sleep "$QPOWD_REBOOT_WAIT"
+
 	local waited=0
 	until modem_cmd "AT" | grep -q "OK"
 	do
 		waited=$((waited + 1))
-		if [ "$waited" -ge 60 ]; then
-			log_step "Modem did not become ready within 60s."
+		if [ "$waited" -ge "$MODEM_READY_TIMEOUT" ]; then
+			log_step "Modem did not become ready within ${MODEM_READY_TIMEOUT}s."
 			return 1
 		fi
 		sleep 1
