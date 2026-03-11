@@ -112,6 +112,16 @@ EOF
   rm -rf "${PUBLIC_DIR}/latest"
   mkdir -p "${PUBLIC_DIR}/latest"
   cp -f "${out_dir}/"* "${PUBLIC_DIR}/latest/"
+
+  # Also add a timestamped copy of the .ipk so users can verify freshness.
+  local ipk_src
+  ipk_src="$(ls "${out_dir}/${PACKAGE_NAME}"*.ipk 2>/dev/null | head -n1)"
+  if [[ -n "${ipk_src}" ]]; then
+    local ipk_name
+    ipk_name="$(basename "${ipk_src}" .ipk)--${stamp}.ipk"
+    cp -f "${ipk_src}" "${PUBLIC_DIR}/latest/${ipk_name}"
+  fi
+
   log "Artifacts copied to ${PUBLIC_DIR}/latest/"
 }
 
