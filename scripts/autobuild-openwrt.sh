@@ -14,6 +14,10 @@ SDK_URL="${BLUE_MERLE_SDK_URL:-https://downloads.openwrt.org/releases/23.05.0/ta
 SDK_FILENAME="${BLUE_MERLE_SDK_FILENAME:-openwrt-sdk-23.05.0-ath79-nand_gcc-12.3.0_musl.Linux-x86_64.tar.xz}"
 SDK_ROOT="${BUILD_DIR}/sdk/${SDK_FILENAME%.tar.xz}"
 
+log() {
+  printf '[autobuild] %s\n' "$*"
+}
+
 MODE="watch"
 if [[ "${1:-}" == "--once" ]]; then
   MODE="once"
@@ -22,10 +26,6 @@ elif [[ "${1:-}" == "--force" ]]; then
   rm -f "${BUILD_DIR}/last-built-commit"
   log "Forced rebuild: state cleared."
 fi
-
-log() {
-  printf '[autobuild] %s\n' "$*"
-}
 
 ensure_sdk() {
   mkdir -p "${BUILD_DIR}/sdk" "${PUBLIC_DIR}/builds" "${LOG_DIR}"
@@ -132,6 +132,9 @@ build_once() {
   local logfile="${LOG_DIR}/build-${short}.log"
 
   log "Cleaning previous build artifacts..."
+  # Wipe SDK build_dir cache for this package to ensure fresh file copies.
+  rm -rf "${SDK_ROOT}/build_dir/target-mips_24kc_musl/${PACKAGE_NAME}"-*
+  rm -f "${SDK_ROOT}/bin/packages/mips_24kc/base/${PACKAGE_NAME}"*.ipk
   (
     cd "${SDK_ROOT}"
     make -j"$(nproc)" V=s "package/${PACKAGE_NAME}/clean" >> "${logfile}" 2>&1 || true
